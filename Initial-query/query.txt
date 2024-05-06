@@ -1,0 +1,421 @@
+-- MIMIC-III version: v1.4.
+
+CREATE OR REPLACE FUNCTION getPreviousStayInICU (patient_id INT, admission_id INT) RETURNS INTERVAL AS $$
+DECLARE
+    admission_date_of_the_current_admission TIMESTAMP;
+    intime_in_the_first_icu TIMESTAMP;
+    outtime_in_the_last_icu TIMESTAMP;
+BEGIN
+    -- Get the admission date of the current admission.
+    SELECT admittime
+    FROM ADMISSIONS
+    INTO admission_date_of_the_current_admission
+    WHERE subject_id = patient_id AND hadm_id = admission_id;
+    -- Get the intime in the first ICU of the first admission.
+    SELECT intime
+    FROM ICUSTAYS
+    INTO intime_in_the_first_icu
+    WHERE subject_id = patient_id AND hadm_id != admission_id AND intime < admission_date_of_the_current_admission
+    ORDER BY intime
+    LIMIT 1;
+    -- Get the outtime in the last ICU of the last admission (the admission prior to the current one).
+    SELECT outtime
+    FROM ICUSTAYS
+    INTO outtime_in_the_last_icu
+    WHERE subject_id = patient_id AND hadm_id != admission_id AND outtime < admission_date_of_the_current_admission
+    ORDER BY outtime DESC
+    LIMIT 1;
+    -- Return the result.
+    IF (intime_in_the_first_icu IS NULL) OR (outtime_in_the_last_icu IS NULL) THEN
+        RETURN 0;
+    END IF;
+    RETURN outtime_in_the_last_icu-intime_in_the_first_icu;
+END;
+$$ LANGUAGE plpgsql;
+
+COPY (
+SELECT DISTINCT
+    p.subject_id as patient_id,
+    p.gender as patient_gender,
+    p.dob as patient_date_of_birth,
+    -- See https://mimic.mit.edu/docs/iii/about/time/ ("Dates of birth" section).
+    -- Therefore, years greater than 90 are fixed to 90.
+    LEAST( EXTRACT(year from AGE(a.admittime, p.dob)) , 90 ) as patient_age,
+    a.hadm_id as admission_id,
+    a.admittime as admission_date,
+    CASE
+        WHEN EXISTS (SELECT * FROM ADMISSIONS as a2 WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime LIMIT 1)
+        THEN (SELECT a2.admittime FROM ADMISSIONS as a2 WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime ORDER BY a2.admittime DESC LIMIT 1)
+        ELSE NULL
+    END admission_date_of_the_previous_admission,
+    CASE
+        WHEN EXISTS (SELECT * FROM ADMISSIONS as a2 WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime LIMIT 1)
+        THEN 'yes'
+        ELSE 'no'
+    END readmission,
+    CASE
+        WHEN a.hospital_expire_flag = 0 THEN 'no'
+        WHEN a.hospital_expire_flag = 1 THEN 'yes'
+    END as exitus,
+    a.admission_type,
+    a.admission_location,
+    a.discharge_location,
+    CASE
+        WHEN EXISTS (SELECT * FROM ICUSTAYS as i WHERE i.subject_id = a.subject_id AND i.hadm_id = a.hadm_id LIMIT 1)
+        THEN (SELECT intime FROM ICUSTAYS as i WHERE i.subject_id = a.subject_id AND i.hadm_id = a.hadm_id ORDER BY intime LIMIT 1)
+        ELSE NULL
+    END as admission_date_in_the_first_icu,
+    CASE
+        WHEN EXISTS (SELECT * FROM ICUSTAYS as i WHERE i.subject_id = a.subject_id AND i.hadm_id = a.hadm_id LIMIT 1)
+        -- In this attribute, there are some negative values.
+        -- These cases correspond to dates (admission to the hospital or admission to the first ICU) that were not introduced correctly in the database.
+        --   So, after applying the subtraction operation, the result is negative.
+        -- After analysing these erroneous intervals, there are 27 cases and there is not any case with more than 2 days (in negative).
+        -- Therefore, negative intervals are fixed to 0.
+        THEN GREATEST( (SELECT intime FROM ICUSTAYS as i WHERE i.subject_id = a.subject_id AND i.hadm_id = a.hadm_id ORDER BY intime LIMIT 1) - a.admittime , interval '00:00:00' )
+        ELSE NULL
+    END as time_between_admission_and_first_ICU,
+    COALESCE(m.charttime, m.chartdate) as culture_date,
+    date_part('month', COALESCE(m.charttime, m.chartdate)) as culture_month,
+    m.spec_itemid as culture_specimen_id,
+    m.spec_type_desc as culture_specimen_type_description,
+    m.org_itemid as culture_microorganism_id,
+    m.org_name as culture_microorganism_name,
+    m.isolate_num as isolate_number,
+    m.interpretation as culture_susceptibility,
+    -- Service in which the patient resided when the culture was carried out.
+    -- If the patient was not in any service when the culture was carried out, we get the last one.
+    -- If the culture was carried out before the patient's admission to the first service, the returned value is 'NO_SERVICE'.
+    CASE
+        WHEN EXISTS (SELECT * FROM SERVICES as s WHERE s.subject_id = a.subject_id AND s.hadm_id = a.hadm_id AND s.transfertime < COALESCE(m.charttime, m.chartdate) AND curr_service IS NOT NULL ORDER BY transfertime DESC LIMIT 1)
+        THEN (SELECT curr_service FROM SERVICES as s WHERE s.subject_id = a.subject_id AND s.hadm_id = a.hadm_id AND s.transfertime < COALESCE(m.charttime, m.chartdate) AND curr_service IS NOT NULL ORDER BY transfertime DESC LIMIT 1)
+        ELSE 'NO_SERVICE'
+    END service_when_culture,
+    -- ICU in which the patient resided when the culture was carried out.
+    -- If the patient was not in any ICU when the culture was carried out, we get the last one.
+    -- If the culture was carried out before the patient's admission to the first ICU, the returned value is 'NO_ICU'. 
+    CASE
+        WHEN EXISTS (SELECT * FROM TRANSFERS as t WHERE t.subject_id = a.subject_id AND t.hadm_id = a.hadm_id AND t.intime < COALESCE(m.charttime, m.chartdate) AND curr_careunit IS NOT NULL ORDER BY intime DESC LIMIT 1)
+        THEN (SELECT curr_careunit FROM TRANSFERS as t WHERE t.subject_id = a.subject_id AND t.hadm_id = a.hadm_id AND t.intime < COALESCE(m.charttime, m.chartdate) AND curr_careunit IS NOT NULL ORDER BY intime DESC LIMIT 1)
+        ELSE 'NO_ICU'
+    END icu_when_culture,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%vancom%')
+        )
+        THEN 'yes'
+        ELSE 'no'
+    END as treated_with_vancomycin_in_previous_admissions,
+    CASE
+        WHEN EXISTS (SELECT * FROM prescriptions WHERE subject_id = a.subject_id AND hadm_id = a.hadm_id AND (LOWER(drug) LIKE '%vancom%') AND (startdate < COALESCE(m.charttime, m.chartdate)))
+        THEN 'yes'
+        ELSE 'no'
+    END as treated_with_vancomycin_in_the_current_admission_before_culture,
+    getPreviousStayInICU(p.subject_id, a.hadm_id) as stay_in_icu_in_previous_admissions,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM MICROBIOLOGYEVENTS as m
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ORG_NAME = 'KLEBSIELLA PNEUMONIAE' OR ORG_NAME = 'ESCHERICHIA COLI' OR ORG_NAME = 'PROTEUS MIRABILIS' OR ORG_NAME = 'ENTEROBACTER SPECIES' OR ORG_NAME = 'SERRATIA MARCESCENS' OR ORG_NAME = 'MORGANELLA MORGANII' OR ORG_NAME = 'CITROBACTER SPECIES')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_colonization_with_enterobacterales_cre,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM MICROBIOLOGYEVENTS as m
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ORG_NAME = 'PSEUDOMONAS AERUGINOSA')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_colonization_with_pseudomonas_aeruginosa,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM MICROBIOLOGYEVENTS as m
+        WHERE
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ORG_NAME = 'ACINETOBACTER BAUMANNII' OR ORG_NAME = 'ACINETOBACTER BAUMANNII COMPLEX')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_colonization_with_acinetobacter_baumannii,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM MICROBIOLOGYEVENTS as m
+        WHERE
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ORG_NAME = 'POSITIVE FOR METHICILLIN RESISTANT STAPH AUREUS')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_colonization_with_sarm,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM MICROBIOLOGYEVENTS as m
+        WHERE
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ORG_NAME = 'STENOTROPHOMONAS (XANTHOMONAS) MALTOPHILIA')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_colonization_with_stenotrophomonas_maltophilia,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM MICROBIOLOGYEVENTS as m
+        WHERE
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ORG_NAME = 'ENTEROCOCCUS AVIUM' OR ORG_NAME = 'ENTEROCOCCUS CASSELIFLAVUS' OR ORG_NAME = 'ENTEROCOCCUS FAECALIS' OR ORG_NAME = 'ENTEROCOCCUS FAECIUM' OR ORG_NAME = 'ENTEROCOCCUS GALLINARUM' OR ORG_NAME = 'ENTEROCOCCUS MUNDTII' OR ORG_NAME = 'ENTEROCOCCUS RAFFINOSUS' OR ORG_NAME = 'ENTEROCOCCUS SP.')
+            ) THEN 'yes'
+        ELSE 'no'
+    END as previous_colonization_with_erv,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%cefotax%' OR LOWER(drug) LIKE '%ceftazidi%' OR LOWER(drug) LIKE '%ceftriaxo%' OR LOWER(drug) LIKE '%cefix%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_third_generation_cephalosporins,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%meropenem%' OR LOWER(drug) LIKE '%ertape%' OR LOWER(drug) LIKE '%imipe%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_carbapenems,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%ciprofloxac%' OR LOWER(drug) LIKE '%levofloxac%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_fluorquinolones,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%tobram%' OR LOWER(drug) LIKE '%gentamic%' OR LOWER(drug) LIKE '%amikac%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_aminoglycosides,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%tazobac%' OR LOWER(drug) LIKE '%ceftazidi%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_b_lactam,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%amphotericin%' OR LOWER(drug) LIKE '%miconazo%' OR LOWER(drug) LIKE '%ketoconazo%' OR LOWER(drug) LIKE '%fluconazo%' OR LOWER(drug) LIKE '%itraconazo%' OR LOWER(drug) LIKE '%voriconazo%' OR LOWER(drug) LIKE '%posaconazo%' OR LOWER(drug) LIKE '%flucytos%' OR LOWER(drug) LIKE '%caspofun%' OR LOWER(drug) LIKE '%micafun%' OR LOWER(drug) LIKE '%anidulafun%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_antifungal_agents,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM prescriptions
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (LOWER(drug) LIKE '%vancom%' OR LOWER(drug) LIKE '%telava%')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as previous_exposure_to_glycopeptides,
+    CASE
+        WHEN EXISTS
+        (
+        SELECT * FROM procedures_icd
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ICD9_CODE = '9390' OR ICD9_CODE = '9670' OR ICD9_CODE = '9671' OR ICD9_CODE = '9672')
+        ) THEN 'yes'
+        ELSE 'no'
+    END as mechanical_ventilation_in_previous_admissions,
+    CASE
+        WHEN
+        EXISTS (
+        SELECT * FROM procedures_icd
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ICD9_CODE = '0794' OR ICD9_CODE = '1160' OR ICD9_CODE = '1169' OR ICD9_CODE = '5280' OR ICD9_CODE = '3350' OR ICD9_CODE = '3351' OR ICD9_CODE = '3352' OR ICD9_CODE = '336' OR ICD9_CODE = '5051' OR ICD9_CODE = '5059' OR ICD9_CODE = '5553' OR ICD9_CODE = '5561' OR ICD9_CODE = '5569' OR ICD9_CODE = '5282' OR ICD9_CODE = '5283' OR ICD9_CODE = '5284' OR ICD9_CODE = '5285' OR ICD9_CODE = '3751' OR ICD9_CODE = '4194' OR ICD9_CODE = '4974' OR ICD9_CODE = '8375' OR ICD9_CODE = '8377' OR ICD9_CODE = '8256' OR ICD9_CODE = '8258')
+        )
+        OR
+        EXISTS (
+        SELECT * FROM diagnoses_icd
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ICD9_CODE = '1992' OR ICD9_CODE = '41406' OR ICD9_CODE = '41407' OR ICD9_CODE = 'V420' OR ICD9_CODE = 'V421' OR ICD9_CODE = 'V422' OR ICD9_CODE = 'V423' OR ICD9_CODE = 'V424' OR ICD9_CODE = 'V425' OR ICD9_CODE = 'V426' OR ICD9_CODE = 'V427' OR ICD9_CODE = 'V4283' OR ICD9_CODE = 'V4284' OR ICD9_CODE = 'V4289' OR ICD9_CODE = 'V429' OR ICD9_CODE = 'E8780')
+        )
+        THEN 'yes'
+        ELSE 'no'
+    END as organ_transplant_in_previous_admissions,
+    CASE
+        WHEN
+        EXISTS (
+        SELECT * FROM procedures_icd
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ICD9_CODE = '4100' OR ICD9_CODE = '4101' OR ICD9_CODE = '4102' OR ICD9_CODE = '4103' OR ICD9_CODE = '4104' OR ICD9_CODE = '4106' OR ICD9_CODE = '4107' OR ICD9_CODE = '4108' OR ICD9_CODE = '4109' OR ICD9_CODE = '4191')
+        )
+        OR
+        EXISTS (
+        SELECT * FROM diagnoses_icd
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ICD9_CODE = '23877' OR ICD9_CODE = 'V4281' OR ICD9_CODE = 'V4282')
+        )
+        THEN 'yes'
+        ELSE 'no'
+    END as hematopoietic_transplant_in_previous_admissions,
+    CASE
+        WHEN
+        EXISTS (
+        SELECT * FROM chartevents
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ITEMID = 1058 OR ITEMID = 6069 OR ITEMID = 6081 OR ITEMID = 5800 OR ITEMID = 5889 OR ITEMID = 1624 OR ITEMID = 1680 OR ITEMID = 2479 OR ITEMID = 2569 OR ITEMID = 2597 OR ITEMID = 6097 OR ITEMID = 6304 OR ITEMID = 6313 OR ITEMID = 6860 OR ITEMID = 6872 OR ITEMID = 227124 OR ITEMID = 227129 OR ITEMID = 224336 OR ITEMID = 224478 OR ITEMID = 225963 OR ITEMID = 224511)
+        )
+        OR
+        EXISTS (
+        SELECT * FROM outputevents
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ITEMID = 40428 OR ITEMID = 40580 OR ITEMID = 40612 OR ITEMID = 42463)
+        )
+        OR
+        EXISTS (
+        SELECT * FROM inputevents_cv
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ITEMID = 30055 OR ITEMID = 44204 OR ITEMID = 44605 OR ITEMID = 44934 OR ITEMID = 45021 OR ITEMID = 42976 OR ITEMID = 44757 OR ITEMID = 45882 OR ITEMID = 44379 OR ITEMID = 44547 OR ITEMID = 44555)
+        )
+        OR
+        EXISTS (
+        SELECT * FROM procedureevents_mv
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ITEMID = 225202 OR ITEMID = 225203 OR ITEMID = 224270 OR ITEMID = 225430 OR ITEMID = 224560 OR ITEMID = 226124)
+        )
+        OR
+        EXISTS (
+        SELECT * FROM datetimeevents
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (ITEMID = 227584)
+        )
+        OR
+        EXISTS (
+        SELECT * FROM microbiologyevents
+        WHERE 
+            hadm_id IN (
+                SELECT hadm_id FROM ADMISSIONS as a2
+                WHERE a.subject_id = a2.subject_id AND a.hadm_id != a2.hadm_id AND a.admittime > a2.admittime
+            )
+            AND (SPEC_ITEMID = 70023)
+        )
+        THEN 'yes'
+        ELSE 'no'
+    END as catheter_in_previous_admissions
+FROM (PATIENTS as p RIGHT OUTER JOIN ADMISSIONS as a ON p.subject_id = a.subject_id)
+      LEFT OUTER JOIN MICROBIOLOGYEVENTS as m ON a.subject_id = m.subject_id AND a.hadm_id = m.hadm_id
+WHERE m.ab_name = 'VANCOMYCIN'
+)
+TO 'C:\Users\Public\Documents\mimic-iii-dataset.csv'
+WITH csv header;
